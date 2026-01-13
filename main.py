@@ -38,5 +38,11 @@ async def startup_event():
     except Exception as e:
         print(f"Startup crawl failed: {e}")
 
+@app.get("/config")
+def get_config():
+    return settings.dict()
 
 app.include_router(ask_router, tags=["ask"])
+
+
+

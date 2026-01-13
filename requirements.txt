@@ -10,3 +10,4 @@ pillow
 pytesseract
 PyMuPDF
 pydantic-settings
+python-multipart

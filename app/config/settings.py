@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
+    OLLAMA_HOST: str = "http://localhost:11434"
     ROOT_URL: str = "https://docs.example.com"
     OLLAMA_MODEL: str = "llama3"
     MAX_PAGES: int = 50

@@ -1,16 +1,17 @@
-import ollama
+
+from ollama import Client
 from app.config.settings import settings
 
+# Create a singleton client (e.g., during app startup)
+client = Client(host=settings.OLLAMA_HOST)  # e.g., "http://localhost:11434"
+
 def chat(messages, model: str = None) -> str:
-    """Return full answer (non-streaming)."""
     model = model or settings.OLLAMA_MODEL
-    resp = ollama.chat(model=model, messages=messages)
+    resp = client.chat(model=model, messages=messages)
     return resp["message"]["content"]
 
 def chat_stream(messages, model: str = None):
-    """Yield chunks of answer progressively (streaming)."""
     model = model or settings.OLLAMA_MODEL
-    stream = ollama.chat(model=model, messages=messages, stream=True)
+    stream = client.chat(model=model, messages=messages, stream=True)
     for chunk in stream:
-        # Each chunk contains partial message content
         yield chunk["message"]["content"]
