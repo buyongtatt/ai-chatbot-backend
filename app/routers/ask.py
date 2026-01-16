@@ -1,4 +1,5 @@
 
+import base64
 import re
 import io
 import json
@@ -68,7 +69,10 @@ async def ask_stream(
 
         # Ingest for RAG (extract text, and images/files if recognized)
         text, meta = extract_any(data, fname)
+        meta = dict(meta or {})
+        meta.setdefault("text", text or "")
         uploaded_meta = meta
+
 
         # If ingest didn't detect image (due to wrong extension), but we sniffed image, add it
         if uploaded_is_image and not meta.get("images"):
@@ -81,7 +85,7 @@ async def ask_stream(
         # Index the uploaded doc (text + images/files)
         global_index.add_document(uploaded_doc_id, {
             "doc_id": uploaded_doc_id,
-            "text": meta.get("text", ""),
+            "text": meta.get("text"),
             "images": meta.get("images", []),
             "files": meta.get("files", []),
         })
@@ -108,40 +112,77 @@ async def ask_stream(
 
     if uploaded_doc_id and uploaded_img_bytes:
         context_text += f"\nAttached image doc_id: {uploaded_doc_id}\n"
-
+    
     prompt = (
         f"Context:\n{context_text}\n\n"
-        "If an image is attached, use it for visual reasoning (only one image is provided).\n"
-        "When referencing images or files, use markers like [[IMAGE:doc_id]] or [[FILE:doc_id]].\n"
-        "Only reference doc_ids listed in the context.\n"
-        f"Question:\n{question}\n\nAnswer:"
+        "You may receive **multiple images** attached through the message's `images` field.\n"
+        "Use all provided images for visual reasoning.\n"
+        "If the question involves visual content, analyze the image(s) directly.\n\n"
+        "When referencing images or files in your answer, use markers like [[IMAGE:doc_id]] or [[FILE:doc_id]].\n"
+        "Only reference doc_ids that are present in the context.\n\n"
+        "If no images are actually attached, say so explicitly.\n"
+        "If images are attached, do NOT deny their existence.\n\n"
+        f"Question:\n{question}\n\n"
+        "Answer:"
     )
+    
+    def _as_bytes(x) -> Optional[bytes]:
+        """Return bytes from raw bytes or base64 str; otherwise None."""
+        if x is None:
+            return None
+        if isinstance(x, (bytes, bytearray)):
+            return bytes(x)
+        if isinstance(x, str):
+            try:
+                # Allow non-strict (some clients add whitespace)
+                return base64.b64decode(x, validate=False)
+            except Exception:
+                return None
+        return None
 
-    # --- 4) Build user message with **ONE** image (raw bytes) ---
-    def build_user_message(prompt: str, ctxs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _gather_all_context_images(ctxs: List[Dict[str, Any]]) -> List[bytes]:
+        out: List[bytes] = []
+        for c in ctxs or []:
+            for img in c.get("images", []):
+                b = _as_bytes(img.get("content"))
+                if b:
+                    out.append(b)
+        return out
+
+    def build_user_message(prompt: str,
+                        ctxs: List[Dict[str, Any]],
+                        include_uploaded_first: bool = True,
+                        max_images: int = 8,
+                        min_bytes: int = 2_000) -> Dict[str, Any]:
+        """
+        - include_uploaded_first=True: put uploaded image first if present
+        - max_images: hard cap to prevent OOM
+        - min_bytes: skip tiny icons/thumbnails
+        """
         msg: Dict[str, Any] = {"role": "user", "content": prompt}
-        attached = False
+        imgs: List[bytes] = []
 
-        # Prefer the uploaded image bytes
-        if uploaded_img_bytes:
-            msg["images"] = [uploaded_img_bytes]  # raw bytes for Ollama Python SDK
-            attached = True
+        # 1) Include uploaded image (if any)
+        if include_uploaded_first and uploaded_img_bytes:
+            if isinstance(uploaded_img_bytes, (bytes, bytearray)) and len(uploaded_img_bytes) >= min_bytes:
+                imgs.append(bytes(uploaded_img_bytes))
 
-        # Fall back to the first image in contexts (requires 'content' raw bytes)
-        if not attached:
-            for c in ctxs:
-                for img in c.get("images", []):
-                    if img.get("content"):
-                        msg["images"] = [img["content"]]  # raw bytes
-                        attached = True
-                        break
-                if attached:
-                    break
+        # 2) Add ALL images from contexts
+        ctx_imgs = _gather_all_context_images(ctxs)
+        for b in ctx_imgs:
+            # if len(imgs) >= max_images:
+            #     break
+            if b and len(b) >= min_bytes:
+                imgs.append(b)
 
-        print(f"[ask_stream] Image attached? {bool(msg.get('images'))}; "
-              f"count={len(msg.get('images', []))}; "
-              f"type={type(msg['images'][0]) if msg.get('images') else None}; "
-              f"size={len(msg['images'][0]) if msg.get('images') else 0}")
+        # 3) Attach if any found
+        if imgs:
+            msg["images"] = imgs
+
+        # Logging
+        total_bytes = sum(len(b) for b in imgs) if imgs else 0
+        print("[ask_stream]"
+            f"count={len(imgs)}; total_bytes={total_bytes}; ")
 
         return msg
 
@@ -149,13 +190,24 @@ async def ask_stream(
         {
             "role": "system",
             "content": (
-                "You are a helpful assistant. Stream the answer progressively. "
-                "If you want to reference a file or image, use markers like [[FILE:doc_id]] or [[IMAGE:doc_id]]. "
-                "Only reference doc_ids listed in the context. Do not invent filenames or raw URLs. "
-                "You may receive a single image; use it for visual reasoning if present."
+                "You are a helpful, grounded assistant. Stream your answer progressively.\n\n"
+                "Context & assets:\n"
+                "- You will receive a text context that lists one or more doc_ids.\n"
+                "- Some doc_ids include FILES and/or IMAGES that the user may have uploaded or were retrieved from the knowledge base.\n"
+                "- Only refer to assets using markers [[FILE:doc_id]] and [[IMAGE:doc_id]]. Do not invent doc_ids, filenames, or URLs.\n\n"
+                "Instructions:\n"
+                "1) First, read and synthesize the provided context text. If images are attached, assume they relate to the context unless stated otherwise.\n"
+                "2) If one or more images are attached, incorporate visual reasoning:\n"
+                "   - Describe only what is visible; avoid assumptions beyond the image content.\n"
+                "   - If there are multiple images, compare/contrast them when relevant.\n"
+                "3) When citing or pointing users to assets, use [[FILE:doc_id]] or [[IMAGE:doc_id]] from the context only.\n"
+                "4) Ground your answer in the context text (and images if present). If the answer is not in the provided context and cannot be reliably inferred from the image(s), say so and propose next steps.\n"
+                "5) Keep the answer concise, structured, and directly responsive to the user's question. If a quick step-by-step helps, use it.\n"
+                "6) Ask a brief clarifying question only if the user’s request is ambiguous and clarification is necessary to proceed.\n"
+                "7) Do not output raw base64 or any links other than markers. Do not reveal internal reasoning.\n"
             ),
         },
-        build_user_message(prompt, contexts),
+        build_user_message(prompt, contexts),  # your function that now attaches ALL images
     ]
 
     # --- 5) Resolve markers back to context items (unchanged) ---
@@ -173,12 +225,15 @@ async def ask_stream(
                 return c
         return None
 
-    # --- 6) Stream text then emit asset events ---
+    
+    def _is_httpish(u: str) -> bool:
+        return isinstance(u, str) and u.startswith(("http://", "https://"))
+
     def json_stream():
         full_answer = ""
         try:
             # Force the vision model here
-            for chunk in chat_stream(messages, model="llama3.2-vision"):
+            for chunk in chat_stream(messages):
                 full_answer += chunk
                 yield json.dumps({"type": "text", "content": chunk}) + "\n"
         finally:
@@ -193,32 +248,61 @@ async def ask_stream(
             print("[ask_stream] File markers:", file_markers)
             print("[ask_stream] Image markers:", image_markers)
 
-            for marker in file_markers:
-                c = resolve_marker(marker, contexts)
-                if c:
-                    for f in c.get("files", []):
-                        src = f.get("source"); mime = f.get("mime")
-                        size = len(f.get("content", b"") or b"")
-                        print(f"[ask_stream] Attaching file: {src} ({mime}, {size} bytes)")
-                        yield json.dumps({
-                            "type": "file",
-                            "doc_id": c.get("doc_id"),
-                            "url": src,
-                            "mime": mime,
-                        }) + "\n"
+            
+        for marker in file_markers:
+            c = resolve_marker(marker, contexts)
+            if not c:
+                continue
 
+            for i, f in enumerate(c.get("files", []) or []):
+                src  = f.get("source")
+                mime = f.get("mime") or "application/octet-stream"
+                buf  = f.get("content") or b""
+                size = len(buf)
+                filename = f.get("filename") or "file.bin"
+
+                payload = {
+                    "type": "file",
+                    "doc_id": c.get("doc_id"),
+                    "mime": mime,
+                    "filename": filename,
+                    "size": size,
+                }
+
+                if _is_httpish(src):
+                    # Good: client can download directly
+                    payload["url"] = src
+                else:
+                    payload["content_b64"] = base64.b64encode(buf).decode("ascii")
+
+                print(f"[ask_stream] Attaching file: {src} ({mime}, {size} bytes)")
+                yield json.dumps(payload) + "\n"
+
+
+            
             for marker in image_markers:
                 c = resolve_marker(marker, contexts)
                 if c:
-                    for img in c.get("images", []):
+                    for idx, img in enumerate(c.get("images", [])):
                         src = img.get("source"); mime = img.get("mime")
-                        size = len(img.get("content", b"") or b"")
-                        print(f"[ask_stream] Attaching image: {src} ({mime}, {size} bytes)")
-                        yield json.dumps({
+                        content = img.get("content") or b""
+                        size = len(content)
+                        payload = {
                             "type": "image",
                             "doc_id": c.get("doc_id"),
-                            "url": src,
                             "mime": mime,
-                        }) + "\n"
+                            "size": size,
+                        }
+                        if _is_httpish(src):
+                            payload["url"] = src
+                        else:
+                            # Attach base64 so the client can render or save
+                            payload["content_b64"] = base64.b64encode(content).decode("ascii")
+                            # optional filename fallback
+                            if img.get("filename"):
+                                payload["filename"] = str(img["filename"])
+                        print(f"[ask_stream] Attaching image: {src} ({mime}, {size} bytes)")
+                        yield json.dumps(payload) + "\n"
+
 
     return StreamingResponse(json_stream(), media_type="application/x-ndjson")

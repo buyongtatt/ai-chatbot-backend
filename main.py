@@ -25,8 +25,6 @@ os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
 
 @app.on_event("startup")
 async def startup_event():
-    global_index.docs.clear()  # always start fresh
-
     try:
         result = await crawl(settings.ROOT_URL)
         for doc_id, content in result.pages.items():
