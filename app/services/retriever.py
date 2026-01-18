@@ -1,271 +1,314 @@
-
-# app/services/retriever.py
 import re
 import math
 from typing import Dict, Any, List, Tuple, Optional
-from collections import Counter, defaultdict
+from collections import defaultdict
+import uuid
+from app.services.ollama_client import chat_stream
 
-class ChunkingRetrieverIndex:
-    """
-    A drop-in replacement for your current RetrieverIndex that:
-      - Chunks documents on add_document
-      - Ranks chunks lexically (TF-IDF-like)
-      - Enforces a token budget for returned contexts
-      - Includes parent images/files ONLY in the first returned chunk for that parent
-    """
+# app/services/retriever.py
+
+class AIRetrieverIndex:
     def __init__(
         self,
-        max_chunk_chars: int = 1200,
-        overlap_chars: int = 200,
-        approx_chars_per_token: int = 4,   # rule of thumb for many LLMs
-        max_context_tokens: int = 3500,    # budget for context_text only
-        min_chunk_chars: int = 200,
+        max_chunk_chars: int = 2500,
+        overlap_chars: int = 400,
+        max_context_tokens: int = 40000,
     ):
         self.max_chunk_chars = max_chunk_chars
         self.overlap_chars = overlap_chars
-        self.approx_chars_per_token = approx_chars_per_token
         self.max_context_tokens = max_context_tokens
-        self.min_chunk_chars = min_chunk_chars
 
-        # Store original parents (for images/files)
-        self.parents: Dict[str, Dict[str, Any]] = {}
+        # Store original documents with metadata
+        self.documents: Dict[str, Dict[str, Any]] = {}
+        
+        # Store chunks for retrieval
+        self.chunks: List[Dict[str, Any]] = []
+        self.doc_to_chunks: Dict[str, List[int]] = defaultdict(list)
 
-        # Flat chunk list and indices
-        self.chunks: List[Dict[str, Any]] = []  # each has: doc_id, parent_doc_id, chunk_index, text
-        self.parent_to_chunk_idxs: Dict[str, List[int]] = defaultdict(list)
+    def add_document(self, doc_id: str, content: Dict[str, Any]) -> None:
+        """Add a document and create chunks for retrieval"""
+        # Store the complete document including images
+        self.documents[doc_id] = content
 
-        # For scoring
-        self.df: Counter = Counter()  # document frequency per term across chunks
-        self.total_chunks: int = 0
+        # Create chunks from text content
+        text = content.get("text", "") or ""
+        chunks = self._split_text_into_chunks(text, doc_id)
 
-    # -------------------
-    # Utility: tokenization & token estimates
-    # -------------------
-    _word_re = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
+        # Add chunks to index
+        start_idx = len(self.chunks)
+        for i, chunk in enumerate(chunks):
+            self.chunks.append(chunk)
+            self.doc_to_chunks[doc_id].append(start_idx + i)
 
-    def _words(self, text: str) -> List[str]:
-        return [w.lower() for w in self._word_re.findall(text or "")]
-
-    def _estimate_tokens(self, text: str) -> int:
-        # Very rough heuristic; safe for local Gemma/Ollama usage.
-        # You can tune to your model if you later add a real tokenizer.
-        if not text:
-            return 0
-        return max(1, math.ceil(len(text) / self.approx_chars_per_token))
-
-    # -------------------
-    # Chunking
-    # -------------------
-    def _split_paragraphs(self, text: str) -> List[str]:
-        # Split on blank lines first (paragraphs)
-        paras = re.split(r"\n\s*\n", text.strip())
-        # Normalize whitespace in paragraphs
-        paras = [re.sub(r"[ \t]+", " ", p.strip()) for p in paras if p.strip()]
-        return paras
-
-    def _build_chunks(self, text: str) -> List[str]:
-        """
-        Greedy paragraph packer with overlap (by characters).
-        Produces chunks close to `max_chunk_chars`, with overlap across boundaries.
-        """
-        if not text:
+    def _split_text_into_chunks(self, text: str, doc_id: str) -> List[Dict[str, Any]]:
+        """Split text into overlapping chunks"""
+        if not text or not text.strip():
             return []
 
-        paras = self._split_paragraphs(text)
-        chunks: List[str] = []
-        cur: List[str] = []
-        cur_len = 0
-
-        for p in paras:
-            if not p:
-                continue
-            if cur_len + len(p) + 1 <= self.max_chunk_chars or cur_len < self.min_chunk_chars:
-                cur.append(p)
-                cur_len += len(p) + 1
+        # Split into paragraphs first, but respect PAGE markers
+        paragraphs = []
+        current_para = ""
+        
+        for line in text.split('\n'):
+            if line.strip().startswith('[PAGE:') or line.strip().startswith('[/PAGE:'):
+                # Treat PAGE markers as separate paragraphs
+                if current_para.strip():
+                    paragraphs.append(current_para.strip())
+                paragraphs.append(line.strip())
+                current_para = ""
+            elif line.strip() == "":
+                if current_para.strip():
+                    paragraphs.append(current_para.strip())
+                    current_para = ""
             else:
-                # finalize current chunk
-                chunk_text = "\n\n".join(cur).strip()
-                if chunk_text:
-                    chunks.append(chunk_text)
-                # seed next chunk with overlap tail from previous chunk
-                if self.overlap_chars > 0 and chunk_text:
-                    tail = chunk_text[-self.overlap_chars:]
-                    cur = [tail, p]
-                    cur_len = len(tail) + 1 + len(p)
-                else:
-                    cur = [p]
-                    cur_len = len(p)
+                current_para += line + "\n"
+        
+        if current_para.strip():
+            paragraphs.append(current_para.strip())
 
-        # last one
-        if cur:
-            chunk_text = "\n\n".join(cur).strip()
-            if chunk_text:
-                chunks.append(chunk_text)
+        chunks = []
+        current_chunk_paragraphs = []
+        current_length = 0
+        chunk_index = 0
+
+        for paragraph in paragraphs:
+            paragraph_length = len(paragraph)
+            
+            # If adding this paragraph would exceed chunk size, finalize current chunk
+            if (current_length + paragraph_length > self.max_chunk_chars and 
+                current_length >= 500 and current_chunk_paragraphs):
+                
+                # Create chunk
+                chunk_text = "\n".join(current_chunk_paragraphs)
+                if chunk_text.strip():
+                    chunks.append({
+                        "chunk_id": f"{doc_id}#chunk-{chunk_index}",
+                        "doc_id": doc_id,
+                        "chunk_index": chunk_index,
+                        "text": chunk_text.strip(),
+                        "char_length": len(chunk_text)
+                    })
+                    chunk_index += 1
+                
+                # Start new chunk with overlap
+                if self.overlap_chars > 0 and current_chunk_paragraphs:
+                    # Take last part of previous chunk as overlap
+                    combined_text = "\n".join(current_chunk_paragraphs)
+                    if len(combined_text) > self.overlap_chars:
+                        overlap_text = combined_text[-self.overlap_chars:]
+                    else:
+                        overlap_text = combined_text
+                    current_chunk_paragraphs = [overlap_text, paragraph]
+                    current_length = len(overlap_text) + paragraph_length
+                else:
+                    current_chunk_paragraphs = [paragraph]
+                    current_length = paragraph_length
+            else:
+                current_chunk_paragraphs.append(paragraph)
+                current_length += paragraph_length + 1  # +1 for \n
+
+        # Handle final chunk
+        if current_chunk_paragraphs:
+            chunk_text = "\n".join(current_chunk_paragraphs)
+            if chunk_text.strip():
+                chunks.append({
+                    "chunk_id": f"{doc_id}#chunk-{chunk_index}",
+                    "doc_id": doc_id,
+                    "chunk_index": chunk_index,
+                    "text": chunk_text.strip(),
+                    "char_length": len(chunk_text)
+                })
 
         return chunks
 
-    # -------------------
-    # Index maintenance
-    # -------------------
-    def _update_df(self, chunk_texts: List[str]) -> None:
-        # update document frequency with set of words in each chunk
-        for t in chunk_texts:
-            terms = set(self._words(t))
-            for w in terms:
-                self.df[w] += 1
-        self.total_chunks += len(chunk_texts)
+    def _build_scoring_prompt(self, query: str, chunk: Dict[str, Any]) -> str:
+        """Build prompt for AI to score chunk relevance"""
+        prompt = f"""TASK: Score how relevant this document chunk is to answer the user question.
 
-    def add_document(self, doc_id: str, content: Dict[str, Any]) -> None:
-        """
-        Ingest a parent document. We:
-          - store the parent
-          - make text chunks and append to global chunk list
-          - update DF statistics
-        Images/files are kept ONLY on the parent to avoid duplication.
-        """
-        # store/overwrite parent
-        self.parents[doc_id] = content
+USER QUESTION: {query}
 
-        text = (content or {}).get("text") or ""
-        # if there's no text (e.g., image-only doc), still add one empty chunk to carry assets
-        chunk_texts = self._build_chunks(text) or [""]
+DOCUMENT CHUNK:
+{chunk.get('text', '')}
 
-        start_idx = len(self.chunks)
-        for i, t in enumerate(chunk_texts):
-            chunk = {
-                "doc_id": f"{doc_id}#chunk-{i}",
-                "parent_doc_id": doc_id,
-                "chunk_index": i,
-                "text": t,
-                # DO NOT inline large images/files here for every chunk
-                "images": [],
-                "files": [],
-            }
-            self.chunks.append(chunk)
-            self.parent_to_chunk_idxs[doc_id].append(start_idx + i)
+DOCUMENT METADATA:
+- Source: {chunk.get('doc_id', 'unknown')}
 
-        # update DF
-        self._update_df(chunk_texts)
+SCORING CRITERIA:
+1. Does the chunk contain specific information that DIRECTLY answers the question?
+2. Are key terms from the question EXPLICITLY mentioned in the chunk?
+3. Is the chunk focused on the MAIN topic of the question?
+4. Does the chunk provide ENOUGH detail to be useful?
 
-    # -------------------
-    # Scoring & retrieval
-    # -------------------
-    def _score(self, query: str, chunk_text: str) -> float:
-        """
-        Simple TF-IDF-like score (no external deps).
-        """
-        if not query or not chunk_text:
-            return 0.0
+SCORE SCALE: Rate from 0.0 to 1.0 where:
+- 0.0 = Completely irrelevant
+- 0.3 = Slightly relevant  
+- 0.5 = Moderately relevant
+- 0.7 = Highly relevant
+- 1.0 = Directly answers the question
 
-        q_terms = self._words(query)
-        if not q_terms:
-            return 0.0
+RESPONSE FORMAT: Provide ONLY a single decimal number between 0.0 and 1.0
 
-        q_tf = Counter(q_terms)
+Your score:"""
+        return prompt
 
-        c_terms = self._words(chunk_text)
-        c_tf = Counter(c_terms)
-
-        score = 0.0
-        N = max(1, self.total_chunks)
-        for w, qf in q_tf.items():
-            df = self.df.get(w, 0)
-            # idf with +1 smoothing
-            idf = math.log((N + 1) / (df + 1)) + 1.0
-            # chunk tf
-            cf = c_tf.get(w, 0)
-            score += (qf * cf) * idf
-        return score
-
-    def _select_under_token_budget(
-        self,
-        ranked_chunk_idxs: List[int],
-        k: int
-    ) -> List[int]:
-        """
-        Keep best chunks until:
-          - we have k chunks OR
-          - we reach max_context_tokens budget
-        We estimate tokens from chunk text length.
-        """
-        selected: List[int] = []
-        tokens_used = 0
-
-        for idx in ranked_chunk_idxs:
-            if len(selected) >= k:
-                break
-            t = self.chunks[idx].get("text", "")
-            est = self._estimate_tokens(t)
-            if tokens_used + est > self.max_context_tokens:
-                # skip overly large chunk if it alone exceeds budget
-                if est > self.max_context_tokens and not selected:
-                    selected.append(idx)
-                break
-            selected.append(idx)
-            tokens_used += est
-
-        return selected
-
-    def _merge_parent_assets_into_first_hit(self, selected_idxs: List[int]) -> List[Dict[str, Any]]:
-        """
-        For each parent_doc_id present in selected chunks:
-          - include images/files ONLY in the FIRST selected chunk for that parent
-          - others remain text-only
-        This keeps your /ask_stream behavior that attaches images from contexts.
-        """
-        out: List[Dict[str, Any]] = []
-        seen_parent: set = set()
-
-        for idx in selected_idxs:
-            ch = dict(self.chunks[idx])  # copy
-            parent_id = ch.get("parent_doc_id")
-            if parent_id and parent_id not in seen_parent:
-                parent = self.parents.get(parent_id, {})
-                # Only attach heavy assets once
-                ch["images"] = parent.get("images", []) or []
-                ch["files"]  = parent.get("files", []) or []
-                seen_parent.add(parent_id)
+    def _get_ai_score(self, query: str, chunk: Dict[str, Any]) -> float:
+        """Get relevance score from AI model"""
+        try:
+            prompt = self._build_scoring_prompt(query, chunk)
+            
+            messages = [
+                {"role": "system", "content": "You are a precise document relevance scorer. Respond with ONLY a decimal number between 0.0 and 1.0."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            # Get response from AI model
+            full_response = ""
+            for chunk_resp in chat_stream(messages):
+                full_response += chunk_resp
+            
+            # Extract score from response
+            score_match = re.search(r'(\d+\.\d+)', full_response)
+            if score_match:
+                score = float(score_match.group(1))
+                return max(0.0, min(1.0, score))
             else:
-                ch["images"] = []
-                ch["files"]  = []
-            out.append(ch)
-        return out
+                return 0.0
+                
+        except Exception as e:
+            print(f"[Retriever] AI scoring error: {e}")
+            return 0.0
 
-    def top_k(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Search over chunks, return up to k chunks with token budget enforced.
-        Returned entries have:
-          - doc_id (chunk id like docs://...#chunk-i)
-          - text (chunk text)
-          - images/files only on the first returned chunk per parent
-        """
+    def score_chunks_with_ai(self, query: str) -> List[Tuple[int, float]]:
+        """Score all chunks based on query relevance using AI"""
+        if not self.chunks or not query.strip():
+            return []
+
+        print(f"[Retriever] Scoring {len(self.chunks)} chunks with AI for query: {query}")
+        
+        scored_chunks = []
+        for i, chunk in enumerate(self.chunks):
+            score = self._get_ai_score(query, chunk)
+            scored_chunks.append((i, score))
+            print(f"[Retriever] Chunk {chunk.get('chunk_id', f'#{i}')}: score={score:.3f}")
+        
+        # Sort by score descending
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+        return scored_chunks
+
+    def retrieve_relevant_context(self, query: str) -> List[Dict[str, Any]]:
+        """Retrieve most relevant context chunks based on AI scoring"""
         if not self.chunks:
             return []
 
-        # rank
-        scores: List[Tuple[float, int]] = []
-        for i, ch in enumerate(self.chunks):
-            s = self._score(query, ch.get("text", ""))
-            if s > 0:
-                scores.append((s, i))
+        # Score all chunks using AI
+        scored_chunks = self.score_chunks_with_ai(query)
+        
+        # Filter relevant chunks (score > 0.25)
+        relevant_chunks = [(idx, score) for idx, score in scored_chunks if score > 0.25]
+        
+        if not relevant_chunks:
+            # Return top 5 chunks if no highly relevant ones found
+            relevant_chunks = scored_chunks[:5]
 
-        # if no scores matched, fallback to recency/insertion order
-        if not scores:
-            ranked_idxs = list(range(min(k, len(self.chunks))))
+        # Select chunks within token budget
+        selected_chunks = []
+        total_tokens = 0
+        max_tokens = self.max_context_tokens // 4
+
+        for chunk_idx, score in relevant_chunks:
+            if chunk_idx >= len(self.chunks):
+                continue
+                
+            chunk = self.chunks[chunk_idx]
+            chunk_tokens = len(chunk["text"]) // 4
+            
+            if total_tokens + chunk_tokens > max_tokens and selected_chunks:
+                break
+                
+            chunk_with_score = chunk.copy()
+            chunk_with_score["relevance_score"] = score
+            selected_chunks.append(chunk_with_score)
+            total_tokens += chunk_tokens
+            
+            if len(selected_chunks) >= 3:
+                break
+
+        print(f"[Retriever] Selected {len(selected_chunks)} chunks with avg score: {sum(c.get('relevance_score', 0) for c in selected_chunks) / len(selected_chunks) if selected_chunks else 0:.3f}")
+        return selected_chunks
+
+    
+    def get_document_assets(self, marker: str) -> Dict[str, Any]:
+        """Get assets (images/files) for a document or image source"""
+        
+        print(f"[DEBUG] Looking for assets for marker: {marker}")
+        
+        # Case 1: Marker is a full document ID
+        if marker.startswith("docs://"):
+            document = self.documents.get(marker)
+            
+            if document:
+                # Check if this document has its own images/files
+                images = document.get("images", [])
+                files = document.get("files", [])
+                
+                # If this document has images/files, return them directly
+                if images or files:
+                    print(f"[DEBUG] Found {len(images)} images and {len(files)} files in document directly")
+                    return {"images": images, "files": files}
+                
+                # If this is a chunk, look up images from parent document
+                meta = document.get("meta", {})
+                if meta.get("is_chunk") and meta.get("parent_document"):
+                    parent_doc_id = meta["parent_document"]
+                    print(f"[DEBUG] This is a chunk, looking up parent: {parent_doc_id}")
+                    parent_document = self.documents.get(parent_doc_id)
+                    if parent_document:
+                        parent_images = parent_document.get("images", [])
+                        parent_files = parent_document.get("files", [])
+                        print(f"[DEBUG] Found {len(parent_images)} images and {len(parent_files)} files from parent")
+                        return {"images": parent_images, "files": parent_files}
+            
+            # If no document found, try manual parent document lookup
+            if '#' in marker:
+                base_doc_id = marker.split('#')[0]
+                print(f"[DEBUG] Trying manual parent lookup: {base_doc_id}")
+                if base_doc_id != marker:
+                    parent_document = self.documents.get(base_doc_id)
+                    if parent_document:
+                        images = parent_document.get("images", [])
+                        files = parent_document.get("files", [])
+                        print(f"[DEBUG] Found {len(images)} images and {len(files)} files from manual parent lookup")
+                        return {"images": images, "files": files}
+        
+        # Case 2: Marker is just an image source ID (like "fftester_page7_area12_18")
+        # Search all documents for this image source
         else:
-            ranked_idxs = [i for _, i in sorted(scores, key=lambda x: x[0], reverse=True)]
+            print(f"[DEBUG] Searching for image source: {marker}")
+            for doc_id, document in self.documents.items():
+                images = document.get("images", [])
+                for img in images:
+                    if img.get("source") == marker:
+                        print(f"[DEBUG] Found image source {marker} in document {doc_id}")
+                        return {"images": [img], "files": []}  # Return just this image
+                
+                # Also check parent documents if this is a chunk
+                meta = document.get("meta", {})
+                if meta.get("is_chunk") and meta.get("parent_document"):
+                    parent_doc_id = meta["parent_document"]
+                    parent_document = self.documents.get(parent_doc_id)
+                    if parent_document:
+                        parent_images = parent_document.get("images", [])
+                        for img in parent_images:
+                            if img.get("source") == marker:
+                                print(f"[DEBUG] Found image source {marker} in parent document {parent_doc_id}")
+                                return {"images": [img], "files": []}  # Return just this image
+        
+        print(f"[DEBUG] No assets found for marker: {marker}")
+        return {"images": [], "files": []}
 
-        # reduce under token budget
-        selected_idxs = self._select_under_token_budget(ranked_idxs, k)
-
-        # attach parent images/files on first hit for that parent
-        return self._merge_parent_assets_into_first_hit(selected_idxs)
-
-
-# Keep your global symbol the same so the rest of your app doesn't change
-global_index = ChunkingRetrieverIndex(
-    max_chunk_chars=1200,
-    overlap_chars=200,
-    approx_chars_per_token=4,
-    max_context_tokens=65000,  # tune this based on your model/context window
+# Global instance
+global_index = AIRetrieverIndex(
+    max_chunk_chars=2500,
+    overlap_chars=400,
+    max_context_tokens=40000,
 )
