@@ -1,0 +1,22 @@
+{
+  "knowledge_bases": [
+    {
+      "area_name": "get_unit_info",
+      "display_name": "Get Unit Info",
+      "url": "http://localhost:8001/getunitinfo/getunitinfo.pdf",
+      "description": "Get Unit Info documentation"
+    },
+    {
+      "area_name": "save_test_result",
+      "display_name": "Save Test Result",
+      "url": "http://localhost:8002/savetestresult/savetestresult.pdf",
+      "description": "Save Test Result documentation"
+    },
+    {
+      "area_name": "error",
+      "display_name": "Error",
+      "url": "http://localhost:8003/error/error.pdf",
+      "description": "Error documentation"
+    }
+  ]
+}

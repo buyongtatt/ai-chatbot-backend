@@ -28,7 +28,6 @@ This backend is a FastAPI service that crawls a given root URL, indexes text, im
 ## 🛠️ Setup Instructions
 
 1. **Prerequisites**
-
    - Python 3.10+
    - [Ollama](https://ollama.ai) installed and the model pulled:
      ```bash
@@ -43,7 +42,6 @@ This backend is a FastAPI service that crawls a given root URL, indexes text, im
    ```
 
    Typical packages:
-
    - `fastapi` — web framework
    - `uvicorn` — ASGI server
    - `httpx` or `requests` — HTTP client
@@ -116,12 +114,43 @@ Response stream:
 
 ---
 
+## � Running with Concurrency Optimizations
+
+To handle multiple concurrent users efficiently, use the dedicated startup script:
+
+```bash
+python start_server.py --workers 4 --port 8000
+```
+
+Options:
+
+- `--workers N`: Number of worker processes (default: 4)
+- `--port N`: Port to listen on (default: 8000)
+- `--host HOST`: Host to bind to (default: 0.0.0.0)
+- `--reload`: Enable auto-reload on code changes
+
+Example for high-concurrency deployment:
+
+```bash
+python start_server.py --workers 8 --port 8000
+```
+
+## 🧪 Testing Concurrent Requests
+
+To test concurrent request handling, run the test script:
+
+```bash
+python test_concurrent_requests.py
+```
+
+This will send multiple simultaneous requests to verify that they are processed concurrently rather than sequentially.
+
 ## 🔍 Operational Notes
 
 - **Doc_id discipline:** Prompts list available doc_ids; model instructed to reference them exactly.
 - **Hybrid resolver:** Backend matches imperfect markers via substring/scheme‑stripped fallback.
 - **Single image limit:** Only one image is fed to the model per request; others can still be attached if referenced.
-- **Timeouts:** Stream generator closes cleanly to prevent “loading forever” after interruption.
+- **Timeouts:** Stream generator closes cleanly to prevent "loading forever" after interruption.
 - **Debug logs:** Byte sizes, MIME types, and doc_ids printed for validation.
 
 ---

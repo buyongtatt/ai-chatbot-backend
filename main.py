@@ -7,8 +7,14 @@ from app.utils.cache import encode_content_for_cache, decode_content_from_cache
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import os
+import uvicorn
 
-app = FastAPI(title="AI Assistant")
+app = FastAPI(
+    title="AI Assistant",
+    # Configure for better concurrency handling
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 # Allow all origins
 app.add_middleware(
@@ -24,43 +30,10 @@ os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
 
 @app.on_event("startup")
 async def startup_event():
-    try:
-        result = await crawl(settings.ROOT_URL)
-        print("=== CRAWL RESULTS ===")
-        for doc_id, content in result.pages.items():
-            print(f"Document ID: {doc_id}")
-            print(f"  Content type: {content.get('content_type', 'unknown')}")
-            print(f"  Text length: {len(content.get('text', ''))}")
-            print(f"  Images count: {len(content.get('images', []))}")
-            print(f"  Files count: {len(content.get('files', []))}")
-            
-            # Show image details
-            images = content.get('images', [])
-            if images:
-                print("  Images:")
-                for i, img in enumerate(images):
-                    source = img.get('source', 'unknown')
-                    filename = img.get('filename', 'unnamed')
-                    size = len(img.get('content', b'')) if img.get('content') else 0
-                    print(f"    {i+1}. {filename} ({source}) - {size} bytes")
-            print()
-            
-            global_index.add_document(doc_id, content)
-            
-        cache_pages = {doc_id: encode_content_for_cache(content) for doc_id, content in result.pages.items()}
-        with open(CACHE_PATH, "w") as f:
-            json.dump({"root_url": settings.ROOT_URL, "pages": cache_pages}, f)
-        print(f"Crawled and cached {len(result.pages)} pages from {settings.ROOT_URL}")
-        
-        # Print index summary
-        print(f"=== INDEX SUMMARY ===")
-        print(f"Indexed documents: {len(global_index.documents)}")
-        print(f"Created chunks: {len(global_index.chunks)}")
-        
-    except Exception as e:
-        print(f"Startup crawl failed: {e}")
-        import traceback
-        traceback.print_exc()
+    """Initialize on startup - crawling will happen on-demand when user asks questions"""
+    print("=== SERVER STARTUP ===")
+    print(f"Ready to crawl on-demand from: {settings.ROOT_URL}")
+    print(f"Cache path: {CACHE_PATH}")
 
 @app.get("/config")
 def get_config():

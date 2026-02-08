@@ -3,13 +3,11 @@ import uuid
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from collections import deque
 from typing import Dict, Any, List, Set, Tuple, Optional
 import mimetypes
 import io
 import re
 from app.config.settings import settings
-from app.services.helper import _remove_fragment
 
 # Optional imports for better extraction
 HAVE_FITZ = False
@@ -47,13 +45,6 @@ class CrawlResult:
         self.files: Dict[str, Dict[str, Any]] = {}
         self.images: Dict[str, Dict[str, Any]] = {}
 
-def _registrable_domain(netloc: str) -> str:
-    parts = netloc.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
-
-def _same_domain_or_subdomain(target: str, base_reg_domain: str) -> bool:
-    return target == base_reg_domain or target.endswith("." + base_reg_domain)
-
 def _is_http_url(u: str) -> bool:
     p = urlparse(u)
     return p.scheme in ("http", "https")
@@ -67,47 +58,6 @@ def _filename_from_url(url: str) -> Optional[str]:
         return None
     name = path.split("/")[-1]
     return name or None
-
-def _split_large_text(text: str, max_chars: int = 15000) -> List[str]:
-    """Split large text while preserving document structure"""
-    if len(text) <= max_chars:
-        return [text]
-    
-    chunks = []
-    paragraphs = text.split('\n\n')
-    current_chunk = []
-    current_length = 0
-    
-    for para in paragraphs:
-        para_length = len(para) + 2  # +2 for \n\n
-        
-        # If adding this paragraph would exceed chunk size
-        if current_length + para_length > max_chars and current_chunk:
-            # Finalize current chunk
-            chunk_text = "\n\n".join(current_chunk).strip()
-            if chunk_text:
-                chunks.append(chunk_text)
-            
-            # Start new chunk with some overlap for context
-            if len(current_chunk) > 2:
-                # Keep last 2 paragraphs for context
-                overlap = current_chunk[-2:]
-                current_chunk = overlap + [para]
-                current_length = sum(len(p) + 2 for p in overlap) + len(para)
-            else:
-                current_chunk = [para]
-                current_length = para_length
-        else:
-            current_chunk.append(para)
-            current_length += para_length
-    
-    # Handle final chunk
-    if current_chunk:
-        chunk_text = "\n\n".join(current_chunk).strip()
-        if chunk_text:
-            chunks.append(chunk_text)
-    
-    return chunks
 
 def _fetch(url: str, headers: Dict[str, str]) -> Tuple[int, str, bytes, str]:
     r = requests.get(url, headers=headers, timeout=settings.REQUEST_TIMEOUT)
@@ -544,188 +494,101 @@ def _extract_from_binary(raw: bytes, mime: str, url: str) -> Tuple[str, List[Dic
 async def crawl(root_url: str) -> CrawlResult:
     result = CrawlResult()
     headers = {"User-Agent": "Mozilla/5.0 (compatible; AI Assistant/1.0)"}
-
-    root_parsed = urlparse(root_url)
-    base_reg = _registrable_domain(root_parsed.netloc)
-
-    queue = deque([(root_url, 0)])
-    visited: Set[str] = set()
     downloaded_binary_sources: Set[str] = set()
 
-    while queue and len(result.pages) < settings.MAX_PAGES:
-        url, depth = queue.popleft()
-        if url in visited or depth > settings.MAX_DEPTH:
-            continue
-        visited.add(url)
+    try:
+        status, content_type, raw, text_guess = _fetch(root_url, headers)
+        if status != 200:
+            print(f"Failed to fetch {root_url}: status {status}")
+            return result
 
-        try:
-            status, content_type, raw, text_guess = _fetch(url, headers)
-            if status != 200:
-                print(f"Skip {url}: status {status}")
-                continue
+        doc_id = f"docs://{root_url}"
 
-            doc_id = f"docs://{url}"
-
-            # Non-HTML → treat as a document (e.g., PDF) and extract text + images
-            if content_type and content_type != "text/html":
-                try:
-                    text, extracted_images = _extract_from_binary(raw, content_type, url)
-                except Exception as e:
-                    print(f"Binary extraction failed for {url}: {e}")
-                    text, extracted_images = "", []
-                
-                # Store the complete document with all images first
-                result.pages[doc_id] = {
-                    "doc_id": doc_id,
-                    "source_url": url,
-                    "content_type": content_type,
-                    "text": text,
-                    "images": extracted_images,
-                    "files": [{
-                        "content": raw,
-                        "mime": content_type or (mimetypes.guess_type(url)[0] or "application/octet-stream"),
-                        "source": url,
-                        "filename": _filename_from_url(url),
-                    }],
-                    "meta": {
-                        "title": None, 
-                        "status": status,
-                        "word_count": len(text.split()),
-                        "paragraph_count": len([p for p in text.split('\n\n') if p.strip()]),
-                        "extraction_method": f"{content_type}_layout_aware",
-                        "is_complete_document": True
-                    }
-                }
-                
-                print(f"Stored complete document {doc_id}: text_len={len(text)}, images={len(extracted_images)}")
-                
-                # Then create chunks if document is large
-                max_doc_size = 20000
-                if len(text) > max_doc_size:
-                    text_chunks = _split_large_text(text, max_doc_size)
-                    print(f"Splitting large document into {len(text_chunks)} chunks")
-                    
-                    # Create chunk references that point to the parent document
-                    for i, chunk_text in enumerate(text_chunks):
-                        chunk_doc_id = f"docs://{url}#chunk-{i+1}"
-                        result.pages[chunk_doc_id] = {
-                            "doc_id": chunk_doc_id,
-                            "source_url": url,
-                            "content_type": content_type,
-                            "text": chunk_text,
-                            "images": [],  # Empty - will look up from parent
-                            "files": [],   # Empty - will look up from parent
-                            "meta": {
-                                "title": None,
-                                "status": status,
-                                "chunk_number": i+1,
-                                "total_chunks": len(text_chunks),
-                                "word_count": len(chunk_text.split()),
-                                "extraction_method": f"{content_type}_layout_aware",
-                                "parent_document": doc_id,
-                                "is_chunk": True
-                            }
-                        }
-                        print(f"Created chunk {i+1}/{len(text_chunks)} for {url}")
-                
-                # Continue to next URL since we've processed this binary document
-                continue
-
-            # HTML flow - Only process if we get here (content_type == "text/html" or content_type == None)
-            soup = BeautifulSoup(text_guess, "html.parser")
-            text, title = _extract_visible_text_from_html(text_guess)
-
-            # Initialize images and files lists for HTML documents only
-            images = []
-            files = []
-            
+        # Non-HTML → treat as a document (e.g., PDF) and extract text + images
+        if content_type and content_type != "text/html":
             try:
-                # Download HTML images
-                images = _download_html_images(url, soup, headers, downloaded_binary_sources)
-                
-                # Download linked documents
-                files = _discover_and_download_linked_files(url, soup, headers, downloaded_binary_sources)
-
-                # For any linked documents we just downloaded, attempt extraction too
-                for f in files:
-                    try:
-                        f_text, f_imgs = _extract_from_binary(f["content"], f["mime"], f["source"])
-                        # Append extracted elements to this page's content
-                        if f_text:
-                            text += ("\n\n[Content from linked document: " + (f["filename"] or f["source"]) + "]\n" + f_text)
-                        # Add extracted images to the main images list
-                        images.extend(f_imgs)
-                    except Exception as e:
-                        print(f"Extraction failed for linked file {f.get('source', 'unknown')}: {e}")
-                        continue
-                        
+                text, extracted_images = _extract_from_binary(raw, content_type, root_url)
             except Exception as e:
-                print(f"Error processing assets for {url}: {e}")
-
-            # Store the complete HTML document with all images first
+                print(f"Binary extraction failed for {root_url}: {e}")
+                text, extracted_images = "", []
+            
             result.pages[doc_id] = {
                 "doc_id": doc_id,
-                "source_url": url,
+                "source_url": root_url,
                 "content_type": content_type,
                 "text": text,
-                "images": images,
-                "files": files,
+                "images": extracted_images,
+                "files": [{
+                    "content": raw,
+                    "mime": content_type or (mimetypes.guess_type(root_url)[0] or "application/octet-stream"),
+                    "source": root_url,
+                    "filename": _filename_from_url(root_url),
+                }],
                 "meta": {
-                    "title": title,
+                    "title": None, 
                     "status": status,
                     "word_count": len(text.split()),
                     "paragraph_count": len([p for p in text.split('\n\n') if p.strip()]),
-                    "extraction_method": "html_layout_aware",
-                    "is_complete_document": True
+                    "extraction_method": f"{content_type}_layout_aware"
                 }
             }
             
-            print(f"Stored complete HTML document {doc_id}: text_len={len(text)}, images={len(images)}, files={len(files)}")
+            print(f"Stored document {doc_id}: text_len={len(text)}, images={len(extracted_images)}")
+            return result
 
-            # Then create chunks if document is large
-            max_doc_size = 20000
-            if len(text) > max_doc_size:
-                text_chunks = _split_large_text(text, max_doc_size)
-                print(f"Splitting large HTML document into {len(text_chunks)} chunks")
-                
-                # Create chunk references that point to the parent document
-                for i, chunk_text in enumerate(text_chunks):
-                    chunk_doc_id = f"{doc_id}#chunk-{i+1}"
-                    result.pages[chunk_doc_id] = {
-                        "doc_id": chunk_doc_id,
-                        "source_url": url,
-                        "content_type": content_type,
-                        "text": chunk_text,
-                        "images": [],  # Empty - will look up from parent
-                        "files": [],   # Empty - will look up from parent
-                        "meta": {
-                            "title": title,
-                            "status": status,
-                            "chunk_number": i+1,
-                            "total_chunks": len(text_chunks),
-                            "word_count": len(chunk_text.split()),
-                            "paragraph_count": len([p for p in chunk_text.split('\n\n') if p.strip()]),
-                            "extraction_method": "html_layout_aware",
-                            "parent_document": doc_id,
-                            "is_chunk": True
-                        }
-                    }
-                    print(f"Created HTML chunk {i+1}/{len(text_chunks)} for {url}")
+        # HTML flow - Only process if we get here (content_type == "text/html" or content_type == None)
+        soup = BeautifulSoup(text_guess, "html.parser")
+        text, title = _extract_visible_text_from_html(text_guess)
 
-            # Enqueue internal links
-            for a in soup.find_all("a", href=True):
-                link = _normalize_url(url, a["href"])
-                link = _remove_fragment(link)
-                if not _is_http_url(link):
+        # Initialize images and files lists for HTML documents
+        images = []
+        files = []
+        
+        try:
+            # Download HTML images
+            images = _download_html_images(root_url, soup, headers, downloaded_binary_sources)
+            
+            # Download linked documents
+            files = _discover_and_download_linked_files(root_url, soup, headers, downloaded_binary_sources)
+
+            # For any linked documents we just downloaded, attempt extraction too
+            for f in files:
+                try:
+                    f_text, f_imgs = _extract_from_binary(f["content"], f["mime"], f["source"])
+                    # Append extracted elements to this page's content
+                    if f_text:
+                        text += ("\n\n[Content from linked document: " + (f["filename"] or f["source"]) + "]\n" + f_text)
+                    # Add extracted images to the main images list
+                    images.extend(f_imgs)
+                except Exception as e:
+                    print(f"Extraction failed for linked file {f.get('source', 'unknown')}: {e}")
                     continue
-                parsed = urlparse(link)
-                if _same_domain_or_subdomain(parsed.netloc, base_reg):
-                    if link not in visited and len(result.pages) + len(queue) < settings.MAX_PAGES:
-                        queue.append((link, depth + 1))
-
+                    
         except Exception as e:
-            print(f"Error crawling {url}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error processing assets for {root_url}: {e}")
+
+        # Store the document
+        result.pages[doc_id] = {
+            "doc_id": doc_id,
+            "source_url": root_url,
+            "content_type": content_type,
+            "text": text,
+            "images": images,
+            "files": files,
+            "meta": {
+                "title": title,
+                "status": status,
+                "word_count": len(text.split()),
+                "paragraph_count": len([p for p in text.split('\n\n') if p.strip()]),
+                "extraction_method": "html_layout_aware"
+            }
+        }
+        
+        print(f"Stored document {doc_id}: text_len={len(text)}, images={len(images)}, files={len(files)}")
+
+    except Exception as e:
+        print(f"Error crawling {root_url}: {e}")
+        import traceback
+        traceback.print_exc()
     
     return result

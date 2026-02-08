@@ -3,7 +3,6 @@ import math
 from typing import Dict, Any, List, Tuple, Optional
 from collections import defaultdict
 import uuid
-from app.services.ollama_client import chat_stream
 
 # app/services/retriever.py
 
@@ -41,11 +40,21 @@ class AIRetrieverIndex:
             self.doc_to_chunks[doc_id].append(start_idx + i)
 
     def _split_text_into_chunks(self, text: str, doc_id: str) -> List[Dict[str, Any]]:
-        """Split text into overlapping chunks"""
+        """Split text into chunks only if document is large enough"""
         if not text or not text.strip():
             return []
 
-        # Split into paragraphs first, but respect PAGE markers
+        # If document is small enough, return it as a single chunk
+        if len(text) <= self.max_chunk_chars:
+            return [{
+                "chunk_id": f"{doc_id}#chunk-0",
+                "doc_id": doc_id,
+                "chunk_index": 0,
+                "text": text.strip(),
+                "char_length": len(text)
+            }]
+
+        # Only chunk if document is large
         paragraphs = []
         current_para = ""
         
@@ -121,120 +130,21 @@ class AIRetrieverIndex:
 
         return chunks
 
-    def _build_scoring_prompt(self, query: str, chunk: Dict[str, Any]) -> str:
-        """Build prompt for AI to score chunk relevance"""
-        prompt = f"""TASK: Score how relevant this document chunk is to answer the user question.
-
-USER QUESTION: {query}
-
-DOCUMENT CHUNK:
-{chunk.get('text', '')}
-
-DOCUMENT METADATA:
-- Source: {chunk.get('doc_id', 'unknown')}
-
-SCORING CRITERIA:
-1. Does the chunk contain specific information that DIRECTLY answers the question?
-2. Are key terms from the question EXPLICITLY mentioned in the chunk?
-3. Is the chunk focused on the MAIN topic of the question?
-4. Does the chunk provide ENOUGH detail to be useful?
-
-SCORE SCALE: Rate from 0.0 to 1.0 where:
-- 0.0 = Completely irrelevant
-- 0.3 = Slightly relevant  
-- 0.5 = Moderately relevant
-- 0.7 = Highly relevant
-- 1.0 = Directly answers the question
-
-RESPONSE FORMAT: Provide ONLY a single decimal number between 0.0 and 1.0
-
-Your score:"""
-        return prompt
-
-    def _get_ai_score(self, query: str, chunk: Dict[str, Any]) -> float:
-        """Get relevance score from AI model"""
-        try:
-            prompt = self._build_scoring_prompt(query, chunk)
-            
-            messages = [
-                {"role": "system", "content": "You are a precise document relevance scorer. Respond with ONLY a decimal number between 0.0 and 1.0."},
-                {"role": "user", "content": prompt}
-            ]
-            
-            # Get response from AI model
-            full_response = ""
-            for chunk_resp in chat_stream(messages):
-                full_response += chunk_resp
-            
-            # Extract score from response
-            score_match = re.search(r'(\d+\.\d+)', full_response)
-            if score_match:
-                score = float(score_match.group(1))
-                return max(0.0, min(1.0, score))
-            else:
-                return 0.0
-                
-        except Exception as e:
-            print(f"[Retriever] AI scoring error: {e}")
-            return 0.0
-
-    def score_chunks_with_ai(self, query: str) -> List[Tuple[int, float]]:
-        """Score all chunks based on query relevance using AI"""
-        if not self.chunks or not query.strip():
-            return []
-
-        print(f"[Retriever] Scoring {len(self.chunks)} chunks with AI for query: {query}")
-        
-        scored_chunks = []
-        for i, chunk in enumerate(self.chunks):
-            score = self._get_ai_score(query, chunk)
-            scored_chunks.append((i, score))
-            print(f"[Retriever] Chunk {chunk.get('chunk_id', f'#{i}')}: score={score:.3f}")
-        
-        # Sort by score descending
-        scored_chunks.sort(key=lambda x: x[1], reverse=True)
-        return scored_chunks
-
     def retrieve_relevant_context(self, query: str) -> List[Dict[str, Any]]:
-        """Retrieve most relevant context chunks based on AI scoring"""
+        """Retrieve all relevant chunks without AI scoring for faster response"""
         if not self.chunks:
             return []
 
-        # Score all chunks using AI
-        scored_chunks = self.score_chunks_with_ai(query)
+        print(f"[Retriever] Retrieved {len(self.chunks)} chunks for query (no scoring needed)")
         
-        # Filter relevant chunks (score > 0.25)
-        relevant_chunks = [(idx, score) for idx, score in scored_chunks if score > 0.25]
-        
-        if not relevant_chunks:
-            # Return top 5 chunks if no highly relevant ones found
-            relevant_chunks = scored_chunks[:5]
-
-        # Select chunks within token budget
-        selected_chunks = []
-        total_tokens = 0
-        max_tokens = self.max_context_tokens // 4
-
-        for chunk_idx, score in relevant_chunks:
-            if chunk_idx >= len(self.chunks):
-                continue
-                
-            chunk = self.chunks[chunk_idx]
-            chunk_tokens = len(chunk["text"]) // 4
-            
-            if total_tokens + chunk_tokens > max_tokens and selected_chunks:
-                break
-                
+        # Return all chunks with a default relevance score
+        result_chunks = []
+        for chunk in self.chunks:
             chunk_with_score = chunk.copy()
-            chunk_with_score["relevance_score"] = score
-            selected_chunks.append(chunk_with_score)
-            total_tokens += chunk_tokens
-            
-            if len(selected_chunks) >= 3:
-                break
-
-        print(f"[Retriever] Selected {len(selected_chunks)} chunks with avg score: {sum(c.get('relevance_score', 0) for c in selected_chunks) / len(selected_chunks) if selected_chunks else 0:.3f}")
-        return selected_chunks
+            chunk_with_score["relevance_score"] = 0.9  # Default high score since all chunks are relevant
+            result_chunks.append(chunk_with_score)
+        
+        return result_chunks
 
     
     def get_document_assets(self, marker: str) -> Dict[str, Any]:

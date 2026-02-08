@@ -7,10 +7,13 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Form, File, UploadFile
 from fastapi.responses import StreamingResponse
 from PIL import Image
+import asyncio
+from app.utils.knowledge_base_manager import kb_manager
 
 from app.services.retriever import global_index
 from app.services.ingest import extract_any
-from app.services.ollama_client import chat_stream
+from app.services.ollama_client import chat_stream, async_chat_stream
+from app.services.crawler import crawl
 
 router = APIRouter()
 
@@ -44,53 +47,63 @@ def analyze_question_intent(question: str) -> Dict[str, bool]:
     }
 
 def build_context_for_ai(relevant_chunks: List[Dict], question: str) -> str:
-    """Build optimized context for AI with chunk-level relevance"""
+    """Build context for AI without exposing internal mechanics"""
     
     context_parts = []
-    context_parts.append(f"USER QUESTION: {question}")
     
-    # Add question intent analysis
-    intent = analyze_question_intent(question)
-    intent_desc = []
-    if intent['wants_visual']:
-        intent_desc.append("Looking for visual content")
-    if intent['wants_data']:
-        intent_desc.append("Looking for data content") 
-    if intent['wants_procedure']:
-        intent_desc.append("Looking for procedural information")
-    
-    if intent_desc:
-        context_parts.append("ANALYSIS: " + ", ".join(intent_desc))
-    
-    context_parts.append("\nRELEVANT CONTEXT CHUNKS (ordered by AI relevance score):\n")
-    context_parts.append("=" * 60)
-    
-    total_chars = 0
-    MAX_CONTEXT_CHARS = 25000
-    
-    for i, chunk in enumerate(relevant_chunks):
-        chunk_text = f"\nCHUNK {i+1} (Relevance Score: {chunk.get('relevance_score', 0):.3f}):\n"
-        chunk_text += f"Source Document: {chunk.get('doc_id', 'unknown')}\n"
-        chunk_text += f"Content: {chunk.get('text', '')}\n"
+    # Just provide the actual content without mentioning chunks or scores
+    if relevant_chunks:
+        context_parts.append("BACKGROUND INFORMATION:")
+        context_parts.append("-" * 50)
         
-        if total_chars + len(chunk_text) > MAX_CONTEXT_CHARS and i > 0:
-            context_parts.append("\n[Additional context omitted due to length limits]")
-            break
-            
-        context_parts.append(chunk_text)
-        total_chars += len(chunk_text)
-    
+        for chunk in relevant_chunks:
+            content = chunk.get('text', '').strip()
+            if content:
+                context_parts.append(content)
+        
+        context_parts.append("-" * 50)
     return "\n".join(context_parts)
 
 @router.post("/ask_stream")
 async def ask_stream(
     question: str = Form(...),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    area_name: Optional[str] = Form(None)
 ):
     uploaded_doc_id: Optional[str] = None
     uploaded_meta: Optional[Dict[str, Any]] = None
     uploaded_img_bytes: Optional[bytes] = None
     uploaded_is_image = False
+
+    # Handle knowledge base URL crawling
+    if area_name:
+        area_name = area_name.strip()
+        if area_name:
+            print(f"[ask_stream] Looking up knowledge base area: {area_name}")
+            
+            # Validate and get URL for the area
+            is_valid, kb_url = kb_manager.validate_area(area_name)
+            
+            if not is_valid or not kb_url:
+                available_areas = kb_manager.list_area_names()
+                error_msg = f"Knowledge base area '{area_name}' not found. Available areas: {', '.join(available_areas)}"
+                print(f"[ask_stream] {error_msg}")
+                # Continue anyway - user might rely on uploaded files only
+            else:
+                print(f"[ask_stream] Crawling knowledge base from: {kb_url}")
+                try:
+                    crawl_result = await crawl(kb_url)
+
+                    # Index all crawled documents
+                    for doc_id, content in crawl_result.pages.items():
+                        global_index.add_document(doc_id, content)
+                        print(f"[ask_stream] Indexed document: {doc_id}")
+
+                    print(f"[ask_stream] Successfully crawled and indexed {len(crawl_result.pages)} documents")
+                except Exception as e:
+                    print(f"[ask_stream] Error crawling knowledge base: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     # Handle uploaded file
     if file:
@@ -149,11 +162,48 @@ async def ask_stream(
     # Track which documents have assets for later use
     relevant_doc_ids = list(set(chunk.get('doc_id') for chunk in relevant_chunks))
 
+    # If user uploaded content, include extracted text in context
+    if uploaded_doc_id:
+        try:
+            # Include the extracted text from uploaded file/image directly in context
+            if uploaded_meta:
+                extracted_text = uploaded_meta.get("text", "").strip()
+                fname = uploaded_meta.get("filename", "uploaded file")
+                mime = uploaded_meta.get("mime", "unknown")
+                
+                if extracted_text:
+                    context_text += f"\n\n{'#'*70}\n"
+                    context_text += f"# ⭐ UPLOADED CONTENT (USER-PROVIDED) ⭐\n"
+                    context_text += f"# File: {fname} | Type: {mime}\n"
+                    context_text += f"{'#'*70}\n"
+                    context_text += f"{extracted_text}\n"
+                    context_text += f"{'#'*70}\n"
+                    print(f"[ask_stream] Added extracted content from {fname} ({len(extracted_text)} chars)")
+                else:
+                    # Even if no text extracted, note that the file exists
+                    context_text += f"\n\n{'#'*70}\n"
+                    context_text += f"# ⭐ UPLOADED CONTENT (USER-PROVIDED) ⭐\n"
+                    context_text += f"# File: {fname} | Type: {mime}\n"
+                    context_text += f"# Content is available for analysis\n"
+                    context_text += f"{'#'*70}\n"
+            
+            # Also make images/files available as references
+            assets = global_index.get_document_assets(uploaded_doc_id)
+            if assets:
+                if uploaded_is_image and assets.get('images'):
+                    fname = uploaded_meta.get("filename", "image") if uploaded_meta else "uploaded image"
+                    context_text += f"\n[Image available as [[IMAGE:{uploaded_doc_id}]] - {fname}]\n"
+                elif assets.get('files'):
+                    fname = uploaded_meta.get("filename", "file") if uploaded_meta else "uploaded file"
+                    context_text += f"\n[File available as [[FILE:{uploaded_doc_id}]] - {fname}]\n"
+            
+            relevant_doc_ids.append(uploaded_doc_id)
+        except Exception as e:
+            print(f"[ask_stream] Error processing uploaded content: {e}")
+
     prompt = f"""{context_text}
 
-QUESTION: {question}
-
-Please answer the question based ONLY on the context provided above. The context chunks are ordered by AI-calculated relevance (highest first). Focus on the most relevant chunks and ignore chunks with low relevance scores."""
+{question}"""
 
     def build_user_message(prompt: str) -> Dict[str, Any]:
         return {"role": "user", "content": prompt}
@@ -162,27 +212,14 @@ Please answer the question based ONLY on the context provided above. The context
         {
             "role": "system",
             "content": (
-                "You are an expert assistant who answers questions based ONLY on provided context.\n\n"
-                "CONTEXT FORMAT:\n"
-                "- Context contains numbered chunks ordered by AI relevance score (1.0 = highest)\n"
-                "- Each chunk shows its relevance score and source document\n"
-                "- Focus primarily on chunks with scores > 0.5\n\n"
-                "YOUR RESPONSE SHOULD:\n"
-                "- Answer ONLY what the question asks\n"
-                "- Use information ONLY from relevant context chunks\n"
-                "- Ignore chunks with relevance < 0.3\n"
-                "- If information isn't in context, say so clearly\n"
-                "- Be concise and focused\n"
-                "- Do NOT include technical implementation details\n"
-                "- Do NOT explain how the scoring worked\n\n"
-                "ASSET HANDLING:\n"
-                "- Assets (images/files) are available from source documents\n"
-                "- Reference assets ONLY when they directly help answer the question\n"
-                "- Use format: [[IMAGE:document_id]] or [[FILE:document_id]]\n"
-                "- Reference BEFORE describing the asset content\n\n"
-                "EXAMPLE FORMAT:\n"
-                "'Based on the context, sales increased by 15%. As shown in [[IMAGE:docs://example.pdf]], the chart illustrates this trend.'\n"
-                "'The configuration steps are provided in [[FILE:docs://config.pdf]].'"
+                "You are a helpful assistant answering questions based on provided information.\n\n"
+                "KEY INSTRUCTIONS:\n"
+                "- If user uploaded content, analyze it thoroughly and use it in your answer\n"
+                "- Provide natural, conversational responses without mentioning how you process information\n"
+                "- Answer only based on the information available\n"
+                "- If you can reference images or files that help explain your answer, use: [[IMAGE:id]] or [[FILE:id]]\n"
+                "- Be concise, helpful, and friendly\n"
+                "- Do NOT mention chunks, relevance scores, or technical processing details"
             ),
         },
         build_user_message(prompt),
@@ -203,10 +240,11 @@ Please answer the question based ONLY on the context provided above. The context
     def _is_httpish(u: str) -> bool:
         return isinstance(u, str) and u.startswith(("http://", "https://"))
 
-    def json_stream():
+    async def async_json_stream():
         full_answer = ""
         try:
-            for chunk in chat_stream(messages):
+            # Use async_chat_stream for non-blocking processing
+            async for chunk in async_chat_stream(messages):
                 full_answer += chunk
                 yield json.dumps({"type": "text", "content": chunk}) + "\n"
         finally:
@@ -357,4 +395,24 @@ Please answer the question based ONLY on the context provided above. The context
                 print(f"[ask_stream] Attaching file: {filename} ({mime}, {len(content)} bytes)")
                 yield json.dumps(payload) + "\n"
 
-    return StreamingResponse(json_stream(), media_type="application/x-ndjson")
+    return StreamingResponse(async_json_stream(), media_type="application/x-ndjson")
+
+
+    @router.get("/debug/knowledge_bases")
+    async def debug_knowledge_bases():
+        """List all available knowledge base areas"""
+        all_areas = kb_manager.get_all_areas()
+    
+        areas_info = []
+        for kb in all_areas:
+            areas_info.append({
+                "area_name": kb.get("area_name"),
+                "display_name": kb.get("display_name"),
+                "url": kb.get("url"),
+                "description": kb.get("description", "")
+            })
+    
+        return {
+            "total": len(areas_info),
+            "knowledge_bases": areas_info
+        }

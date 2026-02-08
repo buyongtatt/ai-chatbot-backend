@@ -7,6 +7,12 @@ class Settings(BaseSettings):
     MAX_PAGES: int = 50
     MAX_DEPTH: int = 3
     REQUEST_TIMEOUT: int = 15
+    KB_CONFIG_PATH: str = "storage/knowledge_bases.json"
+    
+    # Concurrency settings
+    MAX_CONCURRENT_REQUESTS: int = 100
+    MAX_WORKER_PROCESSES: int = 4
+    CONNECTION_LIMIT: int = 1000
 
     class Config:
         env_file = ".env"
